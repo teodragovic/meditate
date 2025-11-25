@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Meditate</title>
+    <link rel="icon" type="image/png" href="/favicon/favicon-96x96.png" sizes="96x96" />
+    <link rel="icon" type="image/svg+xml" href="/favicon/favicon.svg" />
+    <link rel="shortcut icon" href="/favicon/favicon.ico" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/favicon/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="theme-color" content="#ffffff">
+  <style>
+    /* Minimal centered layout */
+    :root {
+      --bg: #0f1724;
+      --card: #0b1220;
+      --accent: #7dd3fc;
+      --muted: #94a3b8;
+    }
+    html,body { height: 100%; margin: 0; font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background: linear-gradient(180deg,var(--bg), #071023); color: #e6eef8; }
+    .wrap {
+      min-height: 100%; display: flex; align-items: center; justify-content: center; padding: 2rem;
+    }
+    .card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+      border-radius: 12px; padding: 28px; width: 360px; box-shadow: 0 10px 30px rgba(2,6,23,0.6);
+      text-align: center;
+    }
+    h1 { margin: 0 0 15px 0; font-size: 18px; letter-spacing: 0.4px; }
+    .player {
+      display: flex; flex-direction: column; gap: 12px; align-items: center;
+    }
+    button.shuffle {
+      appearance: none; border: none; padding: 15px 20px; border-radius: 99px;
+      background: linear-gradient(90deg, rgba(125,211,252,0.12), rgba(125,211,252,0.08)); color: var(--accent);
+      font-weight: 600; cursor: pointer; font-size: 18px;
+      box-shadow: 0 6px 18px rgba(13,52,77,0.12);
+      margin-bottom: 20px;
+    }
+    button.shuffle:active { transform: translateY(1px); }
+    .track-name { font-size: 14px; color: #d8eefc; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    audio { width: 100%; outline: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card" role="main">
+      <h1>Meditate</h1>
+      <button class="shuffle" id="shuffleBtn">Start</button>
+
+      <div class="player" id="player">
+        <div class="track-name" id="trackName">—</div>
+
+        <!-- HTML audio player -->
+        <audio id="audio" controls preload="none">
+          Your browser does not support the audio element.
+        </audio>
+
+        <div class="hint" hidden>
+          <div class="small">Base URL for MP3s (set below) — the script will prepend this to filenames from <code>playlist.json</code> when needed.</div>
+          <input id="baseInput" class="base" />
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <script>
+  /************************************************************************
+   * CONFIG
+   *
+   * Set R2_BASE_URL below (string). It should include protocol and end with '/'
+   * Example: "https://your-bucket.r2.cloudflarestorage.com/"
+   *
+   * If you prefer, leave it empty and enter it in the input field on the page.
+   ************************************************************************/
+  let R2_BASE_URL = 'https://meditation.teodragovic.com/mp3/'; // <-- put your base URL here (or leave blank and paste in the page input)
+
+  // If your site will be served from a custom domain (e.g. media.example.com),
+  // use that here. If you use the default R2 origin, it will look like:
+  // "https://<account>.r2.cloudflarestorage.com/<bucket>/"
+  //
+  // IMPORTANT: Ensure your R2 public bucket (or Worker) is configured to allow
+  // CORS for your site origin so the audio element can fetch files. See notes below.
+
+  /************************************************************************
+   * End config
+   ************************************************************************/
+
+  (function () {
+    const audio = document.getElementById('audio');
+    const nameEl = document.getElementById('trackName');
+    const btn = document.getElementById('shuffleBtn');
+    const baseInput = document.getElementById('baseInput');
+
+    // set audio crossOrigin so caching/requests behave properly when CORS is enabled server-side
+    audio.crossOrigin = 'anonymous';
+    audio.preload = 'none';
+
+    // populate input from config
+    if (R2_BASE_URL) baseInput.value = R2_BASE_URL;
+
+    // small helper: normalize base URL (ensure trailing slash)
+    function normalizeBaseUrl(url) {
+      if (!url) return '';
+      try {
+        // URL constructor throws on relative urls without protocol
+        const u = new URL(url);
+        let out = u.href;
+        if (!out.endsWith('/')) out += '/';
+        return out;
+      } catch (e) {
+        // fallback: naive normalization
+        return url.endsWith('/') ? url : (url + '/');
+      }
+    }
+
+    // Utility: check if a string looks like a full URL
+    function isFullUrl(s) {
+      return /^https?:\/\//i.test(s);
+    }
+
+    // Utility: pick random index
+    function randIndex(max) {
+      return Math.floor(Math.random() * max);
+    }
+
+    // Try to fetch playlist.json (it may contain either filenames or full URLs)
+    async function loadTracks() {
+      try {
+        const resp = await fetch('playlist.json', { cache: 'no-cache' });
+        if (!resp.ok) throw new Error('No playlist.json');
+        const data = await resp.json();
+        if (!Array.isArray(data) || data.length === 0) throw new Error('Empty playlist.json');
+        return data;
+      } catch (e) {
+        console.warn('Could not load playlist.json:', e);
+        return [];
+      }
+    }
+
+    // Compose final track URLs:
+    // - If the entry is a full URL -> use as-is
+    // - Otherwise treat it as filename (or path relative to base) and prepend base
+    function makeUrlForEntry(entry, base) {
+      if (!entry) return null;
+      if (isFullUrl(entry)) return entry;
+      // If entry begins with '/' treat as absolute path on current host (rare)
+      if (entry.startsWith('/')) return entry;
+      // Otherwise combine with base
+      if (!base) {
+        // no base provided: use entry as-is (relative URL)
+        return entry;
+      }
+      // Ensure base is normalized
+      const nbase = normalizeBaseUrl(base);
+      // Use encodeURI for safety
+      return encodeURI(nbase + entry);
+    }
+
+    // Format name shown to user: try decodeURIComponent of last path segment
+    function friendlyNameFromUrl(url) {
+      try {
+        const p = (new URL(url)).pathname;
+        const seg = p.substring(p.lastIndexOf('/') + 1);
+        return decodeURIComponent(seg) || url;
+      } catch (e) {
+        // if not full url, just return entry
+        return url;
+      }
+    }
+
+    // Main bootstrap
+    (async function bootstrap() {
+      // Try to load tracks from playlist.json
+      let rawTracks = await loadTracks();
+
+      // If playlist.json returned empty, disable button and show instructions
+      if (!rawTracks || rawTracks.length === 0) {
+        nameEl.textContent = "No playlist.json found or empty. Add playlist.json with filenames or URLs.";
+        btn.disabled = true;
+        btn.textContent = "No MP3s";
+        return;
+      }
+
+      // Live base value from input (user can paste their R2 base URL here)
+      function currentBase() {
+        return normalizeBaseUrl(baseInput.value.trim() || R2_BASE_URL || '');
+      }
+
+      // Build resolved tracks array of objects {url, label}
+      function resolvedTracks() {
+        const base = currentBase();
+        return rawTracks.map(entry => {
+          const url = makeUrlForEntry(entry, base);
+          return { raw: entry, url, label: friendlyNameFromUrl(url || (entry||'')) };
+        }).filter(t => t.url);
+      }
+
+      // Play by resolved index
+      async function playTrackByIndex(i) {
+        const tracks = resolvedTracks();
+        if (!tracks || tracks.length === 0) return;
+
+        const item = tracks[i];
+        if (!item || !item.url) return;
+
+        nameEl.textContent = item.label;
+        // assign src; encodeURI already applied above
+        audio.src = item.url;
+        // Explicitly call load() (helps some mobiles) then play()
+        try {
+          audio.load();
+          await audio.play();
+        } catch (err) {
+          // some browsers require user gesture — this is in response to button click so should be fine
+          console.warn('play() rejected:', err);
+        }
+      }
+
+      // Shuffle button handler
+      btn.addEventListener('click', () => {
+        const tracks = resolvedTracks();
+        if (!tracks || tracks.length === 0) return;
+        const i = randIndex(tracks.length);
+        playTrackByIndex(i);
+      });
+
+      // Spacebar shortcut
+      window.addEventListener('keydown', (e) => {
+        if (e.code === 'Space' && document.activeElement.tagName !== 'INPUT' && !btn.disabled) {
+          e.preventDefault();
+          btn.click();
+        }
+      });
+
+      // When baseInput changes, update UI label to indicate valid/invalid base
+      baseInput.addEventListener('change', () => {
+        const b = currentBase();
+        if (b) {
+          baseInput.style.borderColor = ''; // reset
+        }
+      });
+
+      // basic validation: if resolvedTracks contain only relative filenames and no base set,
+      // show a small hint to the user (visible via trackName)
+      const anyFull = rawTracks.some(isFullUrl);
+      if (!anyFull && !currentBase()) {
+        nameEl.textContent = "playlist.json contains filenames — please paste your R2 base URL below.";
+      } else {
+        nameEl.textContent = "Ready — click Shuffle & Play";
+      }
+    })();
+  })();
+  </script>
+</body>
+</html>
